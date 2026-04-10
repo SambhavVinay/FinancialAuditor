@@ -1,36 +1,40 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# FinancialAuditor — frontend
 
-## Getting Started
+Next.js **claim submission UI** for the FinancialAuditor stack. It streams claim processing from **`POST /process-claim/stream`** on the configured API base (see below).
 
-First, run the development server:
+## Features
+
+- Form: claim ID, policy type, description, amount, past claims, documents list
+- Optional **damage photo** (drag-and-drop or file picker): resized client-side to JPEG and sent as base64 with `image_mime_type`
+- Optional **image URL** field when no file is attached (passed through to the backend)
+- **Claim history** sidebar: persisted in `localStorage` (`innovitus_claim_history`), last 50 submissions
+- **Agent pipeline** (n8n-style): vertical zigzag graph with @xyflow/react; **Previous / Next / Follow live** navigation; always-visible **activity** panel for the focused step’s log; **Show more** on each node
+
+## Run locally
+
+1. Start the backend from the repo root (see root [README.md](../README.md)).
+2. In this directory:
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Scripts
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Command | Purpose |
+|---------|---------|
+| `npm run dev` | Development server |
+| `npm run build` | Production build |
+| `npm run start` | Serve production build |
+| `npm run lint` | ESLint |
 
-## Learn More
+## API base URL
 
-To learn more about Next.js, take a look at the following resources:
+Set **`NEXT_PUBLIC_API_BASE`** (e.g. in `.env.local`) to your backend origin, without a trailing slash. Default is `http://localhost:8000`. The app calls `${NEXT_PUBLIC_API_BASE}/process-claim/stream`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Stack
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Next.js 16, React 19, TypeScript, Tailwind CSS 4, [@xyflow/react](https://reactflow.dev/) for the n8n-style agent pipeline canvas (see `package.json`).
