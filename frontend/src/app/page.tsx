@@ -23,6 +23,7 @@ interface ClaimResult {
   "Confidence Score": string | number;
   Reason: string;
   "Customer Message": string;
+  "Payout Breakdown"?: Record<string, string> | string;
 }
 
 interface HistoryEntry {
@@ -237,7 +238,7 @@ export default function Home() {
       const entry: HistoryEntry = {
         id: entryId,
         submittedAt,
-        input: { ...form },
+        input: { ...body },
         result: data,
       };
       const updated = [entry, ...history];
@@ -247,10 +248,16 @@ export default function Home() {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       setError(msg);
+      const errorBody: ClaimInput = {
+        ...form,
+        image_url: form.image_url || undefined,
+        image_base64: imageBase64 || undefined,
+        image_mime_type: imageBase64 ? imageMime : undefined,
+      };
       const entry: HistoryEntry = {
         id: entryId,
         submittedAt,
-        input: { ...form },
+        input: errorBody,
         result: null,
       };
       const updated = [entry, ...history];
@@ -264,6 +271,17 @@ export default function Home() {
 
   const loadFromHistory = (entry: HistoryEntry) => {
     setForm({ ...entry.input });
+    setImageBase64(entry.input.image_base64 || null);
+    setImageMime(entry.input.image_mime_type || "image/jpeg");
+    if (entry.input.image_base64) {
+      setImagePreview(
+        `data:${entry.input.image_mime_type || "image/jpeg"};base64,${entry.input.image_base64}`,
+      );
+    } else if (entry.input.image_url) {
+      setImagePreview(entry.input.image_url);
+    } else {
+      setImagePreview(null);
+    }
     setResult(entry.result);
     setError(null);
     setActiveId(entry.id);
@@ -524,6 +542,39 @@ export default function Home() {
         .metric-label { color: rgba(148,163,184,0.65); font-size: 0.82rem; }
         .metric-value { font-size: 0.9rem; font-weight: 600; color: #e2e8f0; }
 
+        /* ── Payout Breakdown table ─────────────────────────────────────── */
+        .breakdown-section {
+          background: rgba(255,255,255,0.025);
+          border: 1px solid rgba(255,255,255,0.07);
+          border-radius: 12px;
+          padding: 1rem 1.1rem;
+          margin-bottom: 1.25rem;
+        }
+        .breakdown-title {
+          font-size: 0.68rem;
+          font-weight: 600;
+          text-transform: uppercase;
+          letter-spacing: 0.09em;
+          color: rgba(148,163,184,0.4);
+          margin-bottom: 0.65rem;
+        }
+        .breakdown-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: baseline;
+          gap: 0.75rem;
+          padding: 0.32rem 0;
+          border-bottom: 1px solid rgba(255,255,255,0.04);
+          font-size: 0.82rem;
+        }
+        .breakdown-row:last-child { border-bottom: none; }
+        .breakdown-key { color: rgba(148,163,184,0.6); flex-shrink: 0; }
+        .breakdown-val { color: #e2e8f0; font-weight: 500; text-align: right; }
+        .breakdown-row.final-row .breakdown-key { color: #4ade80; font-weight: 600; }
+        .breakdown-row.final-row .breakdown-val { color: #4ade80; font-size: 0.95rem; font-weight: 700; }
+        .breakdown-row.reject-row .breakdown-key { color: #f87171; }
+        .breakdown-row.reject-row .breakdown-val { color: #f87171; font-weight: 600; }
+
         /* ── New claim btn ─────────────────────────────────────────────── */
         .new-claim-btn {
           margin: 0.5rem;
@@ -631,78 +682,139 @@ export default function Home() {
                 <div>Submitted claims will appear here.</div>
               </div>
             ) : (
-              history.map((entry) => (
-                <div
-                  key={entry.id}
-                  className={`history-item${activeId === entry.id ? " active" : ""}`}
-                  onClick={() => loadFromHistory(entry)}
-                >
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "0.3rem",
-                      marginBottom: "0.2rem",
-                    }}
-                  >
-                    {entry.result && (
-                      <span
-                        className="history-dot"
-                        style={{ background: getDotColor(entry.result.Status) }}
-                      />
-                    )}
-                    {!entry.result && (
-                      <span
-                        className="history-dot"
-                        style={{ background: "#64748b" }}
-                      />
-                    )}
-                    <span className="history-item-id">
-                      {entry.input.claim_id || "Unnamed Claim"}
-                    </span>
-                  </div>
-                  <div className="history-item-meta">
-                    {fmtDate(entry.submittedAt)} · ₹
-                    {entry.input.claim_amount.toLocaleString("en-IN")}
-                  </div>
-                  {entry.result && (
-                    <div style={{ marginTop: "0.35rem" }}>
-                      <span
-                        className="stat-chip"
+              <>
+                {(() => {
+                  const flaggedHistory = history.filter(
+                    (h) => !h.input.image_url && !h.input.image_base64,
+                  );
+                  const normalHistory = history.filter(
+                    (h) => h.input.image_url || h.input.image_base64,
+                  );
+
+                  const renderItem = (entry: HistoryEntry) => (
+                    <div
+                      key={entry.id}
+                      className={`history-item${activeId === entry.id ? " active" : ""}`}
+                      onClick={() => loadFromHistory(entry)}
+                    >
+                      <div
                         style={{
-                          fontSize: "0.62rem",
-                          padding: "0.15rem 0.5rem",
-                          ...Object.fromEntries(
-                            getChipStyle(entry.result.Status)
-                              .split(";")
-                              .filter(Boolean)
-                              .map((s) => {
-                                const [k, v] = s.split(":");
-                                return [
-                                  k
-                                    .trim()
-                                    .replace(/-([a-z])/g, (_, c) =>
-                                      c.toUpperCase(),
-                                    ),
-                                  v?.trim(),
-                                ];
-                              }),
-                          ),
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "0.3rem",
+                          marginBottom: "0.2rem",
                         }}
                       >
-                        {entry.result.Status}
-                      </span>
+                        {entry.result && (
+                          <span
+                            className="history-dot"
+                            style={{
+                              background: getDotColor(entry.result.Status),
+                            }}
+                          />
+                        )}
+                        {!entry.result && (
+                          <span
+                            className="history-dot"
+                            style={{ background: "#64748b" }}
+                          />
+                        )}
+                        <span className="history-item-id">
+                          {entry.input.claim_id || "Unnamed Claim"}
+                        </span>
+                      </div>
+                      <div className="history-item-meta">
+                        {fmtDate(entry.submittedAt)} · ₹
+                        {entry.input.claim_amount.toLocaleString("en-IN")}
+                      </div>
+                      {entry.result && (
+                        <div style={{ marginTop: "0.35rem" }}>
+                          <span
+                            className="stat-chip"
+                            style={{
+                              fontSize: "0.62rem",
+                              padding: "0.15rem 0.5rem",
+                              ...Object.fromEntries(
+                                getChipStyle(entry.result.Status)
+                                  .split(";")
+                                  .filter(Boolean)
+                                  .map((s) => {
+                                    const [k, v] = s.split(":");
+                                    return [
+                                      k
+                                        .trim()
+                                        .replace(/-([a-z])/g, (_, c) =>
+                                          c.toUpperCase(),
+                                        ),
+                                      v?.trim(),
+                                    ];
+                                  }),
+                              ),
+                            }}
+                          >
+                            {entry.result.Status}
+                          </span>
+                        </div>
+                      )}
+                      <button
+                        className="delete-btn"
+                        onClick={(e) => deleteEntry(entry.id, e)}
+                        title="Remove"
+                      >
+                        ✕
+                      </button>
                     </div>
-                  )}
-                  <button
-                    className="delete-btn"
-                    onClick={(e) => deleteEntry(entry.id, e)}
-                    title="Remove"
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))
+                  );
+
+                  return (
+                    <div
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "1rem",
+                      }}
+                    >
+                      {flaggedHistory.length > 0 && (
+                        <div>
+                          <div
+                            style={{
+                              fontSize: "0.65rem",
+                              fontWeight: 700,
+                              textTransform: "uppercase",
+                              color: "#fbbf24",
+                              marginBottom: "0.5rem",
+                              paddingLeft: "0.3rem",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "0.3rem",
+                            }}
+                          ></div>
+                          {flaggedHistory.map(renderItem)}
+                        </div>
+                      )}
+                      {normalHistory.length > 0 && (
+                        <div>
+                          {flaggedHistory.length > 0 && (
+                            <div
+                              style={{
+                                fontSize: "0.65rem",
+                                fontWeight: 700,
+                                textTransform: "uppercase",
+                                color: "rgba(148,163,184,0.5)",
+                                marginBottom: "0.5rem",
+                                paddingLeft: "0.3rem",
+                              }}
+                            >
+                              Standard Claims
+                            </div>
+                          )}
+                          {normalHistory.map(renderItem)}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </>
             )}
           </div>
 
@@ -1215,6 +1327,37 @@ export default function Home() {
 
                   <hr className="divider" />
 
+                  {/* ── Payout Breakdown ───────────────────────────────── */}
+                  {result["Payout Breakdown"] &&
+                    typeof result["Payout Breakdown"] === "object" && (
+                      <div className="breakdown-section">
+                        <p className="breakdown-title">📊 Payout Breakdown</p>
+                        {Object.entries(result["Payout Breakdown"]).map(
+                          ([key, val]) => {
+                            const isFinal = key === "Final Payout";
+                            const isReject =
+                              key === "Rejection Reason" ||
+                              key === "Match Score";
+                            return (
+                              <div
+                                key={key}
+                                className={`breakdown-row${
+                                  isFinal
+                                    ? " final-row"
+                                    : isReject
+                                      ? " reject-row"
+                                      : ""
+                                }`}
+                              >
+                                <span className="breakdown-key">{key}</span>
+                                <span className="breakdown-val">{val}</span>
+                              </div>
+                            );
+                          },
+                        )}
+                      </div>
+                    )}
+
                   <div style={{ marginBottom: "1.25rem" }}>
                     <p
                       style={{
@@ -1269,6 +1412,33 @@ export default function Home() {
                       {result["Customer Message"]}
                     </p>
                   </div>
+
+                  {/* ── Flagged Warning at the end of generations ── */}
+                  {!imageBase64 && !form.image_url && (
+                    <div
+                      style={{
+                        background: "rgba(251, 191, 36, 0.15)",
+                        border: "1px solid rgba(251, 191, 36, 0.4)",
+                        borderRadius: "10px",
+                        padding: "0.85rem",
+                        marginTop: "1.25rem",
+                        color: "#fbbf24",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "0.65rem",
+                        fontSize: "0.85rem",
+                        fontWeight: 500,
+                      }}
+                    >
+                      <span style={{ fontSize: "1.2rem" }}>⚠️</span>
+                      <span>
+                        <strong style={{ color: "#fcd34d" }}>
+                          Flagged for Review:
+                        </strong>{" "}
+                        No visual evidence provided. Manual inspection required.
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
 
