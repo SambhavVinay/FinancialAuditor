@@ -24,3 +24,17 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* n8n-style dark controls for @xyflow/react (claim pipeline) */
+.claim-flow-controls button {
+  background: #252830 !important;
+  border-bottom: 1px solid #3f3f4d !important;
+  fill: #94a3b8 !important;
+}
+.claim-flow-controls button:hover {
+  background: #323846 !important;
+}
+.claim-flow-controls svg {
+  max-width: 14px;
+  max-height: 14px;
+}

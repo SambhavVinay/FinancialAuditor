@@ -1,6 +1,11 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  ClaimPipelineCanvas,
+  createInitialPipeline,
+  type PipelineStepState,
+} from "@/components/claim-pipeline-canvas";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -25,6 +30,59 @@ interface ClaimResult {
   "Customer Message": string;
 }
 
+type StreamPhase = "precall" | "crew";
+
+type StreamEvent =
+  | {
+      type: "step_started";
+      stepId: string;
+      agentRole: string;
+      phase: StreamPhase;
+    }
+  | {
+      type: "step_progress";
+      stepId: string;
+      message: string;
+    }
+  | {
+      type: "step_finished";
+      stepId: string;
+      agentRole: string;
+      phase: StreamPhase;
+      taskDescription: string;
+      finalOutput: string;
+      rawLog: string;
+    }
+  | { type: "result"; payload: ClaimResult }
+  | { type: "error"; message: string; detail?: string };
+
+async function consumeClaimSse(
+  res: Response,
+  onEvent: (ev: StreamEvent) => void,
+): Promise<void> {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const block of parts) {
+      const line = block.trim();
+      if (!line.startsWith("data: ")) continue;
+      const raw = line.slice(6);
+      try {
+        onEvent(JSON.parse(raw) as StreamEvent);
+      } catch {
+        console.warn("Bad SSE JSON:", raw);
+      }
+    }
+  }
+}
+
 interface HistoryEntry {
   id: string; // unique key
   submittedAt: string; // ISO timestamp
@@ -35,6 +93,8 @@ interface HistoryEntry {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const LS_KEY = "innovitus_claim_history";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
 function loadHistory(): HistoryEntry[] {
   if (typeof window === "undefined") return [];
@@ -144,6 +204,10 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [pipeline, setPipeline] = useState<PipelineStepState[]>([]);
+
+  /** Hide claim history while a claim is streaming; restore when `loading` ends. */
+  const sidebarCollapsed = !sidebarOpen || loading;
 
   // Image upload state
   const [imagePreview, setImagePreview] = useState<string | null>(null);
@@ -208,30 +272,98 @@ export default function Home() {
     [],
   );
 
+  const focusPipelineStep = useCallback((stepId: string) => {
+    setPipeline((prev) =>
+      prev.map((s) => ({ ...s, expanded: s.stepId === stepId })),
+    );
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setResult(null);
     setError(null);
+    setPipeline(createInitialPipeline(!!imageBase64));
 
     const entryId = `${Date.now()}`;
     const submittedAt = new Date().toISOString();
 
-    try {
-      const body: ClaimInput = {
-        ...form,
-        image_url: form.image_url || undefined,
-        image_base64: imageBase64 || undefined,
-        image_mime_type: imageBase64 ? imageMime : undefined,
-      };
+    const body: ClaimInput = {
+      ...form,
+      image_url: form.image_url || undefined,
+      image_base64: imageBase64 || undefined,
+      image_mime_type: imageBase64 ? imageMime : undefined,
+    };
 
-      const res = await fetch("http://localhost:8000/process-claim", {
+    let streamError: Error | null = null;
+    let data: ClaimResult | null = null;
+
+    try {
+      const res = await fetch(`${API_BASE}/process-claim/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(`Server error: ${res.status}`);
-      const data: ClaimResult = await res.json();
+
+      await consumeClaimSse(res, (ev) => {
+        if (ev.type === "step_started") {
+          setPipeline((p) =>
+            p.map((s) => {
+              if (s.stepId !== ev.stepId) {
+                return { ...s, expanded: false };
+              }
+              return {
+                ...s,
+                agentRole: ev.agentRole,
+                phase: ev.phase,
+                status: "running",
+                expanded: true,
+              };
+            }),
+          );
+        }
+        if (ev.type === "step_progress") {
+          setPipeline((p) =>
+            p.map((s) =>
+              s.stepId === ev.stepId
+                ? { ...s, progressMessage: ev.message }
+                : s,
+            ),
+          );
+        }
+        if (ev.type === "step_finished") {
+          setPipeline((p) =>
+            p.map((s) =>
+              s.stepId === ev.stepId
+                ? {
+                    ...s,
+                    status: "done",
+                    agentRole: ev.agentRole,
+                    phase: ev.phase,
+                    taskDescription: ev.taskDescription,
+                    finalOutput: ev.finalOutput,
+                    rawLog: ev.rawLog,
+                    expanded: false,
+                  }
+                : s,
+            ),
+          );
+        }
+        if (ev.type === "result") {
+          data = ev.payload;
+        }
+        if (ev.type === "error") {
+          streamError = new Error(ev.message || "Stream error");
+        }
+      });
+
+      if (streamError) throw streamError;
+      if (!data) throw new Error("No result from server");
+
       setResult(data);
 
       const entry: HistoryEntry = {
@@ -267,6 +399,7 @@ export default function Home() {
     setResult(entry.result);
     setError(null);
     setActiveId(entry.id);
+    setPipeline([]);
   };
 
   const deleteEntry = (id: string, e: React.MouseEvent) => {
@@ -452,7 +585,8 @@ export default function Home() {
           transition: background 0.15s, border-color 0.15s, color 0.15s;
           backdrop-filter: blur(12px);
         }
-        .toggle-btn:hover { background: rgba(139,92,246,0.15); border-color: rgba(139,92,246,0.3); color: #a78bfa; }
+        .toggle-btn:hover:not(:disabled) { background: rgba(139,92,246,0.15); border-color: rgba(139,92,246,0.3); color: #a78bfa; }
+        .toggle-btn:disabled { pointer-events: none; }
 
         /* ── Main content area ─────────────────────────────────────────── */
         .main-content {
@@ -580,20 +714,30 @@ export default function Home() {
 
       {/* Sidebar toggle button */}
       <button
+        type="button"
         className="toggle-btn"
+        disabled={loading}
         onClick={() => setSidebarOpen((o) => !o)}
-        title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+        title={
+          loading
+            ? "Claim history is hidden while this claim is processing"
+            : sidebarCollapsed
+              ? "Expand sidebar"
+              : "Collapse sidebar"
+        }
         style={{
-          left: sidebarOpen ? "calc(268px + 0.75rem)" : "1rem",
+          left: sidebarCollapsed ? "1rem" : "calc(268px + 0.75rem)",
           transition: "left 0.3s cubic-bezier(0.16,1,0.3,1)",
+          opacity: loading ? 0.45 : 1,
+          cursor: loading ? "not-allowed" : "pointer",
         }}
       >
-        {sidebarOpen ? "◀" : "☰"}
+        {sidebarCollapsed ? "☰" : "◀"}
       </button>
 
       <div className="app-shell">
         {/* ── LEFT SIDEBAR ──────────────────────────────────────────────── */}
-        <aside className={`sidebar${sidebarOpen ? "" : " collapsed"}`}>
+        <aside className={`sidebar${sidebarCollapsed ? " collapsed" : ""}`}>
           <div className="sidebar-header">
             <span className="sidebar-title">Claim History</span>
             <span
@@ -615,6 +759,7 @@ export default function Home() {
               setResult(null);
               setError(null);
               setActiveId(null);
+              setPipeline([]);
             }}
           >
             <span>＋</span> New Claim
@@ -714,22 +859,41 @@ export default function Home() {
         </aside>
 
         {/* ── MAIN CONTENT ──────────────────────────────────────────────── */}
-        <div className="main-content">
+        <div
+          className="main-content"
+          style={{
+            padding: loading ? "1.25rem 1.25rem 2rem" : undefined,
+          }}
+        >
           {/* Header */}
 
-          {/* Two-column: form + results */}
+          {/* Two-column: form + results; processing = narrow form left, pipeline right */}
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
-              gap: "1.25rem",
-              maxWidth: 1000,
+              gridTemplateColumns: loading
+                ? "minmax(260px, 30%) minmax(0, 1fr)"
+                : "repeat(auto-fit, minmax(320px, 1fr))",
+              gap: loading ? "1rem" : "1.25rem",
+              maxWidth: loading ? "min(1680px, 100%)" : 1000,
+              width: "100%",
               margin: "0 auto",
               alignItems: "start",
             }}
           >
             {/* ── FORM ─────────────────────────────────────────────────── */}
-            <div className="glass result-card" style={{ borderRadius: 20 }}>
+            <div
+              className="glass result-card"
+              style={{
+                borderRadius: 20,
+                ...(loading && {
+                  padding: "0.85rem 0.75rem",
+                  maxHeight: "calc(100vh - 5.5rem)",
+                  overflowY: "auto",
+                  minWidth: 0,
+                }),
+              }}
+            >
               <div style={{ marginBottom: "1.25rem" }}>
                 <h2
                   style={{
@@ -747,7 +911,9 @@ export default function Home() {
                     marginTop: 3,
                   }}
                 >
-                  All fields required unless marked optional
+                  {loading
+                    ? "Claim is processing — form is read-only. Pipeline uses most of the screen."
+                    : "All fields required unless marked optional"}
                 </p>
               </div>
 
@@ -762,7 +928,7 @@ export default function Home() {
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1fr 1fr",
+                    gridTemplateColumns: loading ? "1fr" : "1fr 1fr",
                     gap: "0.75rem",
                   }}
                 >
@@ -776,6 +942,7 @@ export default function Home() {
                       value={form.claim_id}
                       onChange={handleChange}
                       required
+                      disabled={loading}
                     />
                   </div>
                   <div>
@@ -786,6 +953,7 @@ export default function Home() {
                       className="glass-input"
                       value={form.policy_type}
                       onChange={handleChange}
+                      disabled={loading}
                     >
                       <option value="Comprehensive">Comprehensive</option>
                       <option value="Third-Party">Third-Party</option>
@@ -801,10 +969,11 @@ export default function Home() {
                     name="description"
                     className="glass-input"
                     placeholder="Describe the incident in detail..."
-                    rows={3}
+                    rows={loading ? 4 : 3}
                     value={form.description}
                     onChange={handleChange}
                     required
+                    disabled={loading}
                     style={{ resize: "vertical" }}
                   />
                 </div>
@@ -812,7 +981,7 @@ export default function Home() {
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1fr 1fr",
+                    gridTemplateColumns: loading ? "1fr" : "1fr 1fr",
                     gap: "0.75rem",
                   }}
                 >
@@ -828,6 +997,7 @@ export default function Home() {
                       value={form.claim_amount || ""}
                       onChange={handleChange}
                       required
+                      disabled={loading}
                     />
                   </div>
                   <div>
@@ -842,6 +1012,7 @@ export default function Home() {
                       value={form.past_claims || ""}
                       onChange={handleChange}
                       required
+                      disabled={loading}
                     />
                   </div>
                 </div>
@@ -856,6 +1027,7 @@ export default function Home() {
                     value={form.documents}
                     onChange={handleChange}
                     required
+                    disabled={loading}
                   />
                 </div>
 
@@ -878,14 +1050,15 @@ export default function Home() {
                   {/* Upload zone */}
                   <div
                     onClick={() =>
-                      !imagePreview && fileInputRef.current?.click()
+                      !loading && !imagePreview && fileInputRef.current?.click()
                     }
                     onDragOver={(e) => {
+                      if (loading) return;
                       e.preventDefault();
                       setIsDragOver(true);
                     }}
                     onDragLeave={() => setIsDragOver(false)}
-                    onDrop={handleDrop}
+                    onDrop={loading ? undefined : handleDrop}
                     style={{
                       border: `1.5px dashed ${isDragOver ? "rgba(139,92,246,0.6)" : imagePreview ? "rgba(74,222,128,0.35)" : "rgba(255,255,255,0.1)"}`,
                       borderRadius: 12,
@@ -896,7 +1069,13 @@ export default function Home() {
                           : "rgba(255,255,255,0.02)",
                       transition: "all 0.2s",
                       overflow: "hidden",
-                      cursor: imagePreview ? "default" : "pointer",
+                      cursor:
+                        loading
+                          ? "not-allowed"
+                          : imagePreview
+                            ? "default"
+                            : "pointer",
+                      opacity: loading ? 0.75 : 1,
                       minHeight: imagePreview ? "auto" : 90,
                       display: "flex",
                       alignItems: "center",
@@ -951,6 +1130,7 @@ export default function Home() {
                         {/* Remove btn */}
                         <button
                           type="button"
+                          disabled={loading}
                           onClick={(e) => {
                             e.stopPropagation();
                             clearImage();
@@ -1029,6 +1209,7 @@ export default function Home() {
                         placeholder="…or paste an image URL"
                         value={form.image_url}
                         onChange={handleChange}
+                        disabled={loading}
                         style={{ fontSize: "0.8rem" }}
                       />
                     </div>
@@ -1065,6 +1246,8 @@ export default function Home() {
                 display: "flex",
                 flexDirection: "column",
                 gap: "1.1rem",
+                minWidth: 0,
+                width: loading ? "100%" : undefined,
               }}
             >
               {error && (
@@ -1073,7 +1256,7 @@ export default function Home() {
                 </div>
               )}
 
-              {!result && !loading && !error && (
+              {!result && !loading && !error && pipeline.length === 0 && (
                 <div
                   className="glass result-card"
                   style={{
@@ -1097,40 +1280,46 @@ export default function Home() {
                 </div>
               )}
 
-              {loading && (
-                <div className="glass result-card" style={{ borderRadius: 20 }}>
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "0.75rem",
-                      marginBottom: "1.5rem",
-                    }}
-                  >
-                    <div className="spinner" />
-                    <span
+              {(loading || pipeline.length > 0) && (
+                <div
+                  className="glass result-card"
+                  style={{
+                    borderRadius: 20,
+                    padding: "0.75rem",
+                    overflow: "hidden",
+                    ...(loading && {
+                      minHeight: "clamp(440px, 78vh, 960px)",
+                      flex: "1 1 auto",
+                    }),
+                  }}
+                >
+                  {loading && (
+                    <div
                       style={{
-                        color: "rgba(148,163,184,0.65)",
-                        fontSize: "0.875rem",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "0.5rem",
+                        marginBottom: "0.65rem",
+                        paddingLeft: 4,
                       }}
                     >
-                      Running AI agents — this may take 30–60 seconds…
-                    </span>
-                  </div>
-                  {[80, 55, 65, 40, 90].map((w, i) => (
-                    <div
-                      key={i}
-                      style={{
-                        height: 11,
-                        borderRadius: 6,
-                        background: "rgba(255,255,255,0.05)",
-                        marginBottom: 11,
-                        width: `${w}%`,
-                        animation: "pulseDot 1.5s ease-in-out infinite",
-                        animationDelay: `${i * 0.15}s`,
-                      }}
-                    />
-                  ))}
+                      <span className="spinner" />
+                      <span
+                        style={{
+                          fontSize: "0.72rem",
+                          color: "rgba(148,163,184,0.55)",
+                        }}
+                      >
+                        Live stream · workflow on the right
+                      </span>
+                    </div>
+                  )}
+                  <ClaimPipelineCanvas
+                    pipeline={pipeline}
+                    onStepSelect={focusPipelineStep}
+                    loading={loading}
+                    layout={loading ? "expanded" : "default"}
+                  />
                 </div>
               )}
 

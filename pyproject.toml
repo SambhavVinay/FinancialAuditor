@@ -1,7 +1,7 @@
 [project]
 name = "financialaudit"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI-assisted motor insurance claim demo: FastAPI + CrewAI backend and Next.js frontend"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
