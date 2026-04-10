@@ -79,17 +79,23 @@ def analyze_damage_with_vision(description: str, image_base64: str,
                             "You are a forensic vehicle damage inspector.\n"
                             f"Claimant description: {description}\n\n"
                             "STEP 1 — VALIDITY CHECK:\n"
-                            "Does this image clearly show a damaged or undamaged motor vehicle "
-                            "(car, truck, motorcycle, van, bus)?\n"
+                            "Does this image clearly show a motor vehicle "
+                            "(car, truck, motorcycle, van, bus, bicycle)?\n"
                             "  • If NO  → respond ONLY with: INVALID IMAGE: <one sentence describing what you actually see>\n"
-                            "  • If YES → continue to Step 2.\n\n"
-                            "STEP 2 — DAMAGE CLASSIFICATION (only if image IS a vehicle):\n"
+                            "  • If YES → continue to Step 1b.\n\n"
+                            "STEP 1b — VEHICLE TYPE MATCH:\n"
+                            "Identify the EXACT type of vehicle in the image (e.g. car, motorcycle, bicycle, truck).\n"
+                            "Also identify the vehicle type mentioned in the claimant description above.\n"
+                            "  • If they are DIFFERENT vehicle types → respond ONLY with:\n"
+                            "    VEHICLE_MISMATCH: image shows a <image_vehicle_type>, but description mentions a <described_vehicle_type>\n"
+                            "  • If they are the SAME vehicle type (or close enough, e.g. car/sedan/SUV) → continue to Step 2.\n\n"
+                            "STEP 2 — DAMAGE CLASSIFICATION (only if vehicle types match):\n"
                             "Classify damage as EXACTLY ONE of:\n"
                             "  - Minor    : cosmetic scratches, small dents, paint chips only.\n"
                             "  - Moderate : broken lights, cracked bumper, panel deformation, broken glass.\n"
                             "  - Major    : structural/frame damage, engine crush, airbag deployment, "
                             "wheel arch collapse, vehicle likely total-loss.\n\n"
-                            "Reply in this exact format (for valid vehicle images):\n"
+                            "Reply in this exact format (for valid, matching vehicle images):\n"
                             "Damage Level: <Minor|Moderate|Major>\n"
                             "Reasoning: <one or two sentences describing what you visually observe>"
                         )
@@ -117,7 +123,8 @@ def analyze_damage_with_vision(description: str, image_base64: str,
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        content = resp.json()["choices"][0]["message"].get("content") or ""
+        return content
     except Exception as exc:
         print(f"[VISION] Direct API call failed: {exc}")
         return "Damage Level: Moderate\nReasoning: Vision API unavailable; defaulted to Moderate."
@@ -164,7 +171,11 @@ def compute_image_description_match(vision_analysis: str, description: str) -> i
             timeout=30,
         )
         resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        content = resp.json()["choices"][0]["message"].get("content")
+        if not content:
+            print("[MATCH] API returned empty content — defaulting to 100 (pass-through)")
+            return 100
+        raw = content.strip()
         # Extract first integer from response
         m = re.search(r"(\d+)", raw)
         score = int(m.group(1)) if m else 100
@@ -471,6 +482,14 @@ def process_claim_body(
         verbose=True,
         allow_delegation=False,
     )
+        # Sentinels for vision output
+        INVALID_SENTINEL   = "invalid image"      # image is not a vehicle at all
+        VEHICLE_MISMATCH_SENTINEL = "vehicle_mismatch"  # image vehicle ≠ described vehicle
+        IMAGE_MATCH_THRESHOLD = 50  # payout = 0 if semantic match score < this
+
+        # Extra state for vehicle mismatch
+        vehicle_mismatch_rejection = False
+        vehicle_mismatch_detail    = ""   # e.g. "image shows a motorcycle, description mentions a car"
 
     payout_actuary = Agent(
         role="Payout Actuary",
@@ -545,6 +564,59 @@ def process_claim_body(
             description=data.description,
             image_base64=data.image_base64,
             mime_type=data.image_mime_type or "image/jpeg",
+            print(f"[VISION] Result: {vision_context[:200]}")
+
+            vision_lower = vision_context.lower().strip()
+
+            # ── Sentinel 1: Not a vehicle image ──────────────────────────────
+            if vision_lower.startswith(INVALID_SENTINEL):
+                print("[VISION] ⚠ Not a vehicle image — ignoring vision result.")
+                invalid_image_note = (
+                    "The uploaded image did not show the claimed vehicle. "
+                    "Assessment based on description only."
+                )
+                vision_context = ""  # fall back to text-only
+
+            # ── Sentinel 2: Vehicle type mismatch ────────────────────────────
+            elif vision_lower.startswith(VEHICLE_MISMATCH_SENTINEL):
+                # Extract the mismatch detail from the sentinel line
+                # Format: "VEHICLE_MISMATCH: image shows a X, but description mentions a Y"
+                vehicle_mismatch_detail = vision_context.split(":", 1)[-1].strip()
+                vehicle_mismatch_rejection = True
+                print(f"[VISION] ⛔ Vehicle type mismatch — {vehicle_mismatch_detail}")
+                vision_context = ""  # don't feed wrong-vehicle analysis to agents
+
+            # ── Normal vehicle image: run semantic match check ────────────────
+            else:
+                image_description_match_score = compute_image_description_match(
+                    vision_analysis=vision_context,
+                    description=data.description,
+                )
+                if image_description_match_score < IMAGE_MATCH_THRESHOLD:
+                    image_mismatch_rejection = True
+                    print(
+                        f"[GUARD] ⛔ Image-description mismatch ({image_description_match_score}/100 < "
+                        f"{IMAGE_MATCH_THRESHOLD}) — forcing payout to ₹0."
+                    )
+
+        task_vision = Task(
+            description=(
+                # If we already have real vision output, stamp it in as CONFIRMED
+                (
+                    f"CONFIRMED VISUAL ANALYSIS (Gemma 4 multimodal, image seen directly):\n"
+                    f"{vision_context}\n\n"
+                    f"Claimant description: {data.description}\n"
+                    "Your job: confirm the damage level above is consistent with the description, "
+                    "then re-state it as: 'Damage Level: <level>'"
+                ) if vision_context else (
+                    f"Incident description: {data.description}\n"
+                    f"Image URL (if any): {data.image_url or 'None provided'}\n\n"
+                    "Classify the damage level as Minor, Moderate, or Major. "
+                    "State it explicitly as: 'Damage Level: <level>'"
+                )
+            ),
+            agent=vision_analyst,
+            expected_output="Damage Level: Minor | Moderate | Major, with brief justification.",
         )
         print(f"[VISION] Result: {vision_context[:200]}")
 
@@ -595,6 +667,33 @@ def process_claim_body(
                     ),
                 }
             )
+        # Pre-compute expected payout range for the communicator
+        lo_rate, hi_rate = DAMAGE_RATES.get(precomputed_damage, (0.50, 0.70))
+        mid_rate = (lo_rate + hi_rate) / 2
+        penalty = min(data.past_claims * 0.02, 0.10)
+        est_payout = max(int((data.claim_amount * mid_rate - DEDUCTIBLE) * (1 - penalty)), 0)
+        is_rejected = data.past_claims > FRAUD_THRESHOLD or "third" in data.policy_type.lower()
+
+        task_output = Task(
+            description=(
+                f"Claim ID: {data.claim_id}\n"
+                f"Damage Level: {precomputed_damage.capitalize()}\n"
+                f"Eligibility: {'Rejected' if is_rejected else 'Eligible'}\n"
+                f"Estimated Payout from Actuary: ₹{est_payout if not is_rejected else 0}\n"
+                f"Past Claims: {data.past_claims}\n\n"
+                "Return ONLY a raw JSON object (no markdown) with these exact keys:\n"
+                '"Claim ID": the claim ID string,\n'
+                '"Status": "Approved" | "Partially Approved" | "Rejected",\n'
+                '"Estimated Payout": integer (use the Actuary\'s figure above),\n'
+                '"Confidence Score": a percentage string like "91%",\n'
+                '"Reason": one concise professional sentence about the decision,\n'
+                '"Customer Message": a warm, polite 2-sentence message appropriate to the Status above.\n'
+                '"Payout Breakdown": leave this key as an empty string — it will be filled automatically.\n'
+                "If Status is Approved or Partially Approved, the Customer Message MUST be positive and confirm processing."
+            ),
+            agent=communicator,
+            expected_output='Raw JSON object with keys: Claim ID, Status, Estimated Payout, Confidence Score, Reason, Customer Message, Payout Breakdown.',
+        )
 
     task_vision = Task(
         description=(
@@ -784,6 +883,45 @@ def process_claim_body(
         f"(img={bool(data.image_base64)}, vision_contradicts={vision_contradicts}, "
         f"match_score={image_description_match_score}, past_claims={data.past_claims})"
     )
+        # Always set payout from guard (it's either the validated LLM value
+        # or our recalculated one — either way it's within the rules)
+        final_payout = guard["payout"]
+
+        # ── Image-Description Mismatch Override ──────────────────────────────
+        # Hard rule: if the uploaded photo doesn't match the description by at
+        # least 50%, the entire claim is zeroed out regardless of other factors.
+        any_photo_rejection = image_mismatch_rejection or vehicle_mismatch_rejection
+
+        if vehicle_mismatch_rejection:
+            final_payout = 0
+            result["Reason"] = (
+                f"Claim denied: the submitted image does not match the claimed vehicle. "
+                f"{vehicle_mismatch_detail.capitalize()}. "
+                f"Please resubmit with a valid photo of the vehicle described in your claim."
+            )
+            # Extract vehicle types for a personalised customer message
+            # vehicle_mismatch_detail: "image shows a motorcycle, but description mentions a car"
+            result["Customer Message"] = (
+                f"We regret to inform you that your claim cannot be processed at this time. "
+                f"Our AI inspection system detected that the photo you submitted does not show "
+                f"the vehicle described in your claim — {vehicle_mismatch_detail}. "
+                f"Please resubmit your claim with a clear photograph of the actual vehicle "
+                f"mentioned in your incident description."
+            )
+
+        elif image_mismatch_rejection:
+            final_payout = 0
+            mismatch_note = (
+                f"Claim denied: the submitted photo does not match the incident description "
+                f"(visual-match score {image_description_match_score}/100, "
+                f"minimum required: {IMAGE_MATCH_THRESHOLD}/100)."
+            )
+            result["Reason"] = mismatch_note
+            result["Customer Message"] = (
+                "We regret to inform you that your claim could not be processed. "
+                "The submitted photograph does not appear to match the described incident; "
+                "please resubmit with a matching image or contact our support team for assistance."
+            )
 
     try:
         result["Estimated Payout"] = int(
@@ -826,11 +964,56 @@ def process_claim_body(
                 f"A {data.past_claims * 2}% prior-claims penalty was applied."
                 if data.past_claims > 0
                 else ""
+        # Append override notes to reason if the guard had to intervene
+        if not any_photo_rejection and guard["override"] and guard["note"]:
+            result["Reason"] = (result.get("Reason", "") + " " + guard["note"]).strip()
+
+        # ── DETERMINISTIC STATUS ─────────────────────────────────────────────
+        if any_photo_rejection:
+            result["Status"] = "Rejected"
+        else:
+            llm_status = result.get("Status", "")
+            result["Status"] = derive_status(
+                payout=final_payout,
+                past_claims=data.past_claims,
+                policy_type=data.policy_type,
+                damage_level=damage_level,
+                llm_status=llm_status,
             )
         ).strip()
 
     if invalid_image_note:
         result["Reason"] = (invalid_image_note + " " + result.get("Reason", "")).strip()
+        # ── DETERMINISTIC CONFIDENCE SCORE ───────────────────────────────────
+        # Check if vision result contradicts the claimant's text description
+        # (e.g. description says "small scratch" but vision says "Major")
+        text_implied_damage = extract_damage_level(data.description)
+        vision_contradicts = (
+            bool(vision_context)  # only meaningful if image was uploaded
+            and damage_level != text_implied_damage
+            and not (text_implied_damage == "moderate")  # moderate is ambiguous default
+        )
+        # A mismatch-rejected claim always counts as contradicting
+        if any_photo_rejection:
+            vision_contradicts = True
+        is_rejected_flag = result["Status"] == "Rejected"
+
+        result["Confidence Score"] = compute_confidence(
+            has_image=bool(data.image_base64),
+            documents=data.documents,
+            past_claims=data.past_claims,
+            damage_level=damage_level,
+            policy_type=data.policy_type,
+            vision_contradicts_description=vision_contradicts,
+            is_rejected=is_rejected_flag,
+            final_payout=final_payout,
+            claim_amount=data.claim_amount,
+        )
+        print(f"[CONFIDENCE] {result['Confidence Score']} "
+              f"(img={bool(data.image_base64)}, vision_contradicts={vision_contradicts}, "
+              f"match_score={image_description_match_score}, past_claims={data.past_claims})")
+
+        # Always ensure payout is a clean int
         try:
             current_score = int(result["Confidence Score"].replace("%", ""))
             result["Confidence Score"] = f"{max(35, current_score - 20)}%"
@@ -842,6 +1025,93 @@ def process_claim_body(
 
 def _sse_line(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            result["Estimated Payout"] = final_payout
+
+        # ── Fix Customer Message if actuary failed and communicator wrote an error msg ──
+        # Skip generic fixes if a mismatch rejection message was already written
+        bad_phrases = ["cannot process", "missing", "incomplete information",
+                       "unable to calculate", "please provide"]
+        customer_msg = result.get("Customer Message", "")
+        if not any_photo_rejection and final_payout > 0 and any(p in customer_msg.lower() for p in bad_phrases):
+            status_word = result["Status"]
+            result["Customer Message"] = (
+                f"Thank you for submitting your claim. We are pleased to inform you that your claim "
+                f"has been {status_word.lower()} with an estimated payout of "
+                f"\u20b9{final_payout:,}. Our team will process the disbursement shortly."
+            )
+
+        # Fix Reason if it contains error/debug language
+        reason = result.get("Reason", "")
+        if not any_photo_rejection and final_payout > 0 and any(p in reason.lower() for p in ["cannot", "missing", "unable"]):
+            dmg = guard.get("damage_label", precomputed_damage.capitalize())
+            result["Reason"] = (
+                f"Claim approved under {data.policy_type} policy. "
+                f"Damage classified as {dmg}. "
+                + (f"A {data.past_claims * 2}% prior-claims penalty was applied." if data.past_claims > 0 else "")
+            ).strip()
+
+        # If image was invalid (not a vehicle), note it in the reason and reduce confidence
+        if invalid_image_note:
+            result["Reason"] = (invalid_image_note + " " + result.get("Reason", "")).strip()
+            # Reduce confidence — we had no valid visual evidence
+            try:
+                current_score = int(result["Confidence Score"].replace("%", ""))
+                result["Confidence Score"] = f"{max(35, current_score - 20)}%"
+            except (ValueError, TypeError):
+                pass
+
+        # ── DETERMINISTIC PAYOUT BREAKDOWN ───────────────────────────────────
+        # Computed entirely in Python so the numbers always match the final payout.
+        # This is the transparent audit trail shown to the user.
+        clean_final_payout = int(
+            str(result["Estimated Payout"]).replace(",", "").replace("₹", "").strip()
+        ) if result["Estimated Payout"] else 0
+
+        if image_mismatch_rejection:
+            result["Payout Breakdown"] = {
+                "Damage Level": damage_level.capitalize(),
+                "Rejection Reason": "Photo does not match the incident description",
+                f"Match Score": f"{image_description_match_score}/100 (minimum required: {IMAGE_MATCH_THRESHOLD}/100)",
+                "Final Payout": f"₹0",
+            }
+        elif result["Status"] == "Rejected":
+            # Rejected by policy or fraud rules — no payout math to show
+            reject_note = guard.get("note", "Claim rejected per policy rules.")
+            result["Payout Breakdown"] = {
+                "Damage Level": damage_level.capitalize(),
+                "Rejection Reason": reject_note,
+                "Final Payout": "₹0",
+            }
+        else:
+            # Normal approved/partially-approved claim — show full math
+            dmg_key = damage_level.lower().strip()
+            if dmg_key not in DAMAGE_RATES:
+                dmg_key = "moderate"
+            lo_r, hi_r = DAMAGE_RATES[dmg_key]
+            mid_r = (lo_r + hi_r) / 2
+            base_payout    = int(data.claim_amount * mid_r)
+            after_deductible = base_payout - DEDUCTIBLE
+            penalty_pct    = min(data.past_claims * 0.02, 0.10)
+            after_penalty  = int(after_deductible * (1 - penalty_pct))
+
+            breakdown: dict = {
+                "Damage Level": damage_level.capitalize(),
+                "Applicable Rate Range": f"{int(lo_r * 100)}% – {int(hi_r * 100)}%",
+                "Applied Rate (midpoint)": f"{int(mid_r * 100)}%",
+                "Claim Amount": f"₹{data.claim_amount:,}",
+                "Base Payout (Claim × Rate)": f"₹{base_payout:,}",
+                "Deductible": f"− ₹{DEDUCTIBLE:,}",
+                "After Deductible": f"₹{max(after_deductible, 0):,}",
+            }
+            if data.past_claims > 0:
+                breakdown[f"Prior-Claims Penalty ({data.past_claims} × 2%)"] = (
+                    f"− {int(penalty_pct * 100)}%  →  − ₹{after_deductible - after_penalty:,}"
+                )
+                breakdown["After Penalty"] = f"₹{max(after_penalty, 0):,}"
+            breakdown["Final Payout"] = f"₹{clean_final_payout:,}"
+            result["Payout Breakdown"] = breakdown
+
+        return result
 
 
 @app.post("/process-claim")
